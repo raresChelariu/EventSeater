@@ -399,6 +399,12 @@ dialog::backdrop{background:rgba(20,12,15,.42);backdrop-filter:blur(2px)}
 .dlg-body select{
   padding:6px 8px;background:var(--surface-2);border:1px solid var(--rule);border-radius:3px;
 }
+.dlg-body input[type="password"]{
+  width:100%;padding:8px 10px;background:var(--surface-2);
+  border:1px solid var(--rule);border-radius:3px;
+  font-family:var(--f-mono);letter-spacing:.06em;
+}
+.dlg-foot .btn[disabled]{opacity:.55;cursor:default}
 .dlg-foot{
   display:flex;justify-content:flex-end;gap:7px;padding:0 18px 16px;align-items:center;
 }

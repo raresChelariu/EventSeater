@@ -51,6 +51,8 @@
         <button id="m-photos">Import a folder of photos&hellip;</button>
         <button id="m-print">Print the table plan</button>
         <hr>
+        <button id="m-connect">Shared plan&hellip;</button>
+        <hr>
         <button id="m-export">Download backup (.json)</button>
         <button id="m-csv">Download list (.csv)</button>
         <button id="m-import">Restore from backup&hellip;</button>
@@ -111,6 +113,22 @@
   <div class="dlg-foot">
     <button class="btn" id="group-add">Add a group</button>
     <button class="btn btn-primary" data-close>Done</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-connect">
+  <div class="dlg-head">
+    <h3>Shared plan</h3>
+    <p id="connect-msg"></p>
+  </div>
+  <div class="dlg-body">
+    <input type="password" id="connect-key" autocomplete="current-password"
+           placeholder="Passphrase" aria-label="Passphrase">
+  </div>
+  <div class="dlg-foot">
+    <button class="btn btn-danger" id="connect-off">Disconnect</button>
+    <button class="btn" data-close>Cancel</button>
+    <button class="btn btn-primary" id="connect-go">Connect</button>
   </div>
 </dialog>
 

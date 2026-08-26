@@ -5,7 +5,9 @@
    Constants & tiny helpers
    ============================================================= */
 const LS_KEY    = "placecard.v1";
-const DATA_PATH = "data/plan.json";
+const KEY_STORE = "placecard.key";
+const DATA_PATH = "data/plan.json";   // artifact host: a published data file
+const API_PATH  = "/api/plan";        // static host: the Pages Function
 const THUMB     = 160;            // stored photo edge, px
 const RING_R    = 94;             // ring radius for the plan disc
 
@@ -45,6 +47,13 @@ let artifactNS = null;
 let downloadsNS = null;
 let filesFormOK = true;
 let readOnly = false;
+
+/* Where a save goes. "artifact" inside the Claude viewer, "api" against the
+   Pages Function once a passphrase is held, "local" otherwise — in which case
+   the browser's own storage is the only copy. */
+let backend    = "local";
+let apiKey     = null;
+let apiVersion = 0;
 
 let selectedId = null;
 let query      = "";
@@ -106,31 +115,67 @@ function commit(opts){
 }
 function scheduleSave(){
   clearTimeout(saveTimer);
-  if (artifactNS && !readOnly && filesFormOK) setStatus("unsaved", "Not saved yet");
+  if (backend !== "local" && !readOnly) setStatus("unsaved", "Not saved yet");
   saveTimer = setTimeout(doSave, 1200);
 }
+
+/* ---- the Pages Function backend ------------------------------------- */
+async function apiFetch(opts){
+  const res = await fetch(API_PATH, Object.assign({
+    cache: "no-store",
+    headers: Object.assign({ "x-plan-key": apiKey || "" }, (opts && opts.headers) || {})
+  }, opts || {}));
+  if (res.status === 401) throw { code: "unauthorized" };
+  if (res.status === 409) throw { code: "conflict" };
+  if (res.status === 413) throw { code: "too_large" };
+  if (!res.ok) throw { code: "http_" + res.status };
+  return res.json();
+}
+const apiGet = () => apiFetch({ method: "GET" });
+const apiPut = () => apiFetch({
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ baseVersion: apiVersion, data: S })
+});
+
+/** Someone else's version won. Ours would only resurrect on reload, so drop it. */
+function yieldToRemote(){
+  try { localStorage.removeItem(LS_KEY); } catch (e){}
+  toast("Someone else saved first. Loading their latest plan…");
+  setTimeout(() => location.reload(), 1400);
+}
+
 async function doSave(){
-  if (!artifactNS || readOnly || !filesFormOK){ setStatus("idle", "This device only"); return; }
+  if (backend === "local" || readOnly){ setStatus("idle", "This device only"); return; }
   if (saving){ again = true; return; }
   saving = true;
   setStatus("saving", "Saving");
   try {
-    await artifactNS.publish({ [DATA_PATH]: JSON.stringify(S) });
+    if (backend === "api"){
+      const r = await apiPut();
+      apiVersion = r.version;
+    } else {
+      await artifactNS.publish({ [DATA_PATH]: JSON.stringify(S) });
+    }
     setStatus("saved", "Saved");
   } catch (err){
     const code = (err && err.code) || "upstream_error";
     if (code === "conflict"){
-      // Someone published first. Their version is the truth — drop our local
-      // copy so the reload does not resurrect it, then reload.
-      try { localStorage.removeItem(LS_KEY); } catch (e){}
-      toast("Someone else saved first. Loading their latest plan…");
-      setTimeout(() => location.reload(), 1400);
+      yieldToRemote();
+    } else if (code === "unauthorized"){
+      // The passphrase was changed or revoked server-side.
+      backend = "local";
+      apiKey = null;
+      try { localStorage.removeItem(KEY_STORE); } catch (e){}
+      setStatus("error", "Not connected");
+      toast("That passphrase is no longer accepted. Your work is safe in this browser — reconnect from the ⋯ menu.");
     } else if (code === "not_writer" || code === "not_granted" ||
                code === "not_declared" || code === "consent_required"){
       readOnly = true;
       setStatus("readonly", "View only");
       toast("You can look but not change this plan.");
     } else if (code === "capability_disabled" || code === "capability_removed"){
+      backend = "local";
       filesFormOK = false;
       setStatus("idle", "This device only");
       toast("Saving to the shared plan isn't available here. Your work stays in this browser — download a backup to keep it.");
@@ -142,6 +187,7 @@ async function doSave(){
       setTimeout(doSave, 5000);
     } else {
       setStatus("error", "Save failed");
+      toast("Couldn't reach the shared plan. Your work is safe in this browser and will go up on the next change.");
     }
   } finally {
     saving = false;
@@ -1016,6 +1062,84 @@ function toast(msg){
 /* =============================================================
    Boot
    ============================================================= */
+/* =============================================================
+   Shared plan (static hosting) — connect with the passphrase
+   ============================================================= */
+async function connect(pass){
+  const prevKey = apiKey, prevBackend = backend;
+  apiKey = pass;
+  try {
+    const r = await apiGet();
+    apiVersion = r.version || 0;
+    backend = "api";
+    try { localStorage.setItem(KEY_STORE, pass); } catch (e){}
+
+    const remote = looksLikePlan(r.data) ? r.data : null;
+    const ru = remote ? (remote.plan.updatedAt || 0) : -1;
+    const lu = S.plan.updatedAt || 0;
+
+    if (remote && ru >= lu){
+      S = normalise(remote);
+      tiles.clear();
+      selectedId = null;
+      writeLocal();
+      render();
+      toast("Connected. Loaded the shared plan.");
+    } else {
+      scheduleSave();      // nothing up there yet, or ours is newer — send it
+      toast(remote ? "Connected. Your copy was newer, so it's going up." :
+                     "Connected. This plan is now the shared one.");
+    }
+    setStatus("saved", "Shared");
+    return true;
+  } catch (err){
+    apiKey = prevKey;
+    backend = prevBackend;
+    if (err && err.code === "unauthorized") toast("That passphrase wasn't accepted.");
+    else toast("Couldn't reach the shared plan from here.");
+    return false;
+  }
+}
+
+function disconnect(){
+  apiKey = null;
+  apiVersion = 0;
+  backend = "local";
+  try { localStorage.removeItem(KEY_STORE); } catch (e){}
+  setStatus("idle", "This device only");
+  toast("Disconnected. This browser keeps its own copy.");
+}
+
+function openConnect(){
+  const on = backend === "api";
+  $("#connect-msg").textContent = on
+    ? "This browser is saving to the shared plan. Disconnect and it keeps a private copy instead."
+    : "Enter the passphrase to share one plan across your devices. Without it, this browser keeps its own private copy.";
+  $("#connect-key").value = "";
+  $("#connect-key").hidden = on;
+  $("#connect-go").hidden = on;
+  $("#connect-off").hidden = !on;
+  $("#dlg-connect").showModal();
+  if (!on) setTimeout(() => $("#connect-key").focus(), 30);
+}
+
+$("#m-connect").addEventListener("click", () => { closeMenu(); openConnect(); });
+$("#connect-off").addEventListener("click", () => { disconnect(); $("#dlg-connect").close(); });
+$("#connect-go").addEventListener("click", async () => {
+  const pass = $("#connect-key").value.trim();
+  if (!pass) return;
+  const btn = $("#connect-go");
+  btn.disabled = true;
+  btn.textContent = "Connecting…";
+  const ok = await connect(pass);
+  btn.disabled = false;
+  btn.textContent = "Connect";
+  if (ok) $("#dlg-connect").close();
+});
+$("#connect-key").addEventListener("keydown", ev => {
+  if (ev.key === "Enter"){ ev.preventDefault(); $("#connect-go").click(); }
+});
+
 async function use(name){
   try {
     return (window.claude && typeof window.claude.use === "function")
@@ -1023,23 +1147,76 @@ async function use(name){
   } catch (e){ return null; }
 }
 
-async function boot(){
-  const local = readLocal();
+/** Tolerate a hand-edited or half-written payload rather than throwing on it. */
+function normalise(st){
+  if (!st || typeof st !== "object") st = blank();
+  if (!st.plan || typeof st.plan !== "object") st.plan = blank().plan;
+  if (!st.photos || typeof st.photos !== "object") st.photos = {};
+  ["guests", "tables", "groups"].forEach(k => {
+    if (!Array.isArray(st.plan[k])) st.plan[k] = [];
+  });
+  st.plan.tables.forEach(t => { if (!Array.isArray(t.guestIds)) t.guestIds = []; });
+  return st;
+}
+const looksLikePlan = d => !!(d && d.plan && Array.isArray(d.plan.guests));
 
-  let remote = null;
+async function fetchArtifactData(){
   try {
     const res = await fetch(DATA_PATH, { cache: "no-store" });
-    if (res.ok){
-      const parsed = await res.json();
-      if (parsed && parsed.plan && Array.isArray(parsed.plan.guests)) remote = parsed;
-    }
-  } catch (e){ /* no data file yet, or the host served the shell — fine */ }
+    if (!res.ok) return null;
+    const parsed = await res.json();
+    return looksLikePlan(parsed) ? parsed : null;
+  } catch (e){ return null; }   // no data file yet, or the host served the shell
+}
+async function fetchApiData(){
+  const r = await apiGet();
+  apiVersion = r.version || 0;
+  return looksLikePlan(r.data) ? r.data : null;
+}
 
-  const lu = local  ? (local.plan.updatedAt  || 0) : -1;
+/** Take the newer of ours and shared, and push ours up if it was ahead. */
+async function reconcile(fetcher){
+  let remote = null;
+  try {
+    remote = await fetcher();
+  } catch (err){
+    if (err && err.code === "unauthorized"){
+      backend = "local";
+      apiKey = null;
+      try { localStorage.removeItem(KEY_STORE); } catch (e){}
+      setStatus("error", "Not connected");
+      toast("That passphrase wasn't accepted. Reconnect from the ⋯ menu.");
+    } else {
+      setStatus("error", "Offline");
+      toast("Couldn't reach the shared plan. Working from this browser's copy.");
+    }
+    return;
+  }
+
+  // Read the live state, not a boot-time snapshot — an edit made while the
+  // capability was still resolving must not be silently overwritten.
+  const lu = S.plan.updatedAt || 0;
   const ru = remote ? (remote.plan.updatedAt || 0) : -1;
-  S = (ru >= lu ? remote : local) || blank();
-  if (!S.photos) S.photos = {};
-  S.plan.tables.forEach(t => { if (!Array.isArray(t.guestIds)) t.guestIds = []; });
+
+  if (remote && ru >= lu){
+    S = normalise(remote);
+    tiles.clear();
+    selectedId = null;
+    writeLocal();
+    render();
+    setStatus("saved", "Saved");
+  } else {
+    setStatus("saved", "Ready");
+    if (lu > 0 && lu > ru) scheduleSave();   // ours is ahead — send it up
+  }
+}
+
+async function boot(){
+  const local = readLocal();
+  try { apiKey = localStorage.getItem(KEY_STORE) || null; } catch (e){}
+
+  // Paint from the local copy straight away; the network comes after.
+  S = normalise(local || blank());
 
   try {
     const v = localStorage.getItem(LS_KEY + ".view");
@@ -1054,10 +1231,14 @@ async function boot(){
   // Capabilities arrive later — light the shared save up when they do.
   artifactNS  = await use("artifact");
   downloadsNS = await use("downloads");
+
   if (artifactNS){
-    setStatus("saved", remote ? "Saved" : "Ready");
-    // If local was ahead of the published file, push it up straight away.
-    if (lu > ru) scheduleSave();
+    backend = "artifact";
+    $("#m-connect").hidden = true;     // the viewer already syncs; no passphrase
+    await reconcile(fetchArtifactData);
+  } else if (apiKey){
+    backend = "api";
+    await reconcile(fetchApiData);
   }
 }
 
